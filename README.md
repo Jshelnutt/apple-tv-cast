@@ -1,26 +1,24 @@
-# Apple TV Cast (free)
+# Apple TV Cast
 
-One big button: **Cast to Apple TV**. It sends your PC screen and sound to your Apple TV over Wi-Fi.
+Free, real-time mirroring of a Windows PC's screen **and sound** to an Apple TV,
+with one big **Cast to Apple TV** button.
 
-**Be aware:** the TV shows things about **3–8 seconds late**. That's fine for videos, photos and slides. It's not good for games or for moving the mouse. True real-time mirroring like AirParrot uses Apple's locked encryption (FairPlay), and no free open-source program can send that today.
+The window (`castapp.py`, Python/Tk, built into `AppleTVCast.exe` with PyInstaller)
+is a front end for **doubletake.exe**, from
+[Jshelnutt/doubletake](https://github.com/Jshelnutt/doubletake/tree/windows) (branch
+`windows`), a Windows port of the open-source AirPlay mirroring sender
+[omarroth/doubletake](https://github.com/omarroth/doubletake) (LGPL-3.0).
 
-## How it works (plain terms)
-1. The free tool ffmpeg records your screen and sound into small video chunks.
-2. A tiny web server on your PC serves those chunks over your home Wi-Fi.
-3. The app asks the Apple TV (using AirPlay, via the free pyatv library) to play that address.
+* **Set up Apple TV** finds the Apple TV (pyatv), then runs
+  `doubletake.exe -target <ip> -pair -pair-only` and asks for the code shown on the TV.
+  The pairing keys are saved in `%APPDATA%\AppleTVCast\doubletake-credentials.json`.
+  The TV's name and address go in `%APPDATA%\AppleTVCast\config.json`.
+* **Cast / Stop** starts and stops `doubletake.exe -target <ip> -creds ... -quit-on-stdin-eof`.
+  The log is written to `%APPDATA%\AppleTVCast\cast.log`.
+* The picture is captured with `ffmpeg.exe` (ddagrab/gdigrab, GPU H.264 encoder when available).
+  Sound comes from Windows' own speaker loopback (WASAPI), so no Stereo Mix is needed.
 
-## One-time Apple TV settings
-Settings → AirPlay and HomeKit → Allow Access: **Everyone on the same network** (or "Anyone on the same network"). The first time you click **Set up Apple TV**, the TV shows a 4-digit PIN. Type it into the app. This only happens once.
+Expected delay is well under a second, not the 3-8 s of the old HLS version.
 
-## PC sound
-Windows needs a "recording" device that captures what the speakers play. Do one of these:
-- Turn on **Stereo Mix**: Sound settings → More sound settings → Recording → right-click → Show disabled devices → Enable Stereo Mix. Or
-- Install the free "screen-capture-recorder" (it adds `virtual-audio-capturer`).
-Then put its name in `%APPDATA%\AppleTVCast\config.json` as `"audio_device": "Stereo Mix (Realtek(R) Audio)"`. To list the names, run: `ffmpeg -list_devices true -f dshow -i dummy`.
-
-## Install (Windows)
-See INSTALL_WINDOWS.md.
-
-## Status
-- Tested on Linux: the video-chunk pipeline, the web server, and the pyatv functions are present.
-- **Not tested yet:** a real Apple TV, PIN pairing, Windows screen and sound capture, and the exe build.
+Tests: `DOUBLETAKE_BIN_DIR=<folder with doubletake + doubletake-test-receiver> pytest tests`
+(pairs, casts and stops against doubletake's built-in fake Apple TV).

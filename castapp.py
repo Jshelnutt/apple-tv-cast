@@ -1,11 +1,18 @@
-"""Apple TV Cast - free PC-to-Apple TV casting (HLS + AirPlay play_url via pyatv).
-Delayed casting (~3-8 s), NOT real-time mirroring."""
-import asyncio, json, os, shutil, socket, subprocess, sys, tempfile, threading
-import functools, http.server
+"""Apple TV Cast - free real-time PC-to-Apple TV screen mirroring.
+
+The window is a thin front end for doubletake.exe (Jshelnutt/doubletake,
+Windows port of omarroth/doubletake), which speaks the AirPlay mirroring
+protocol: picture via ffmpeg desktop capture + H.264, sound via WASAPI
+loopback. pyatv is only used to find the Apple TV on the network.
+"""
+import asyncio, json, os, re, shutil, subprocess, sys, threading
 from pathlib import Path
 
-CONFIG = Path(os.environ.get("APPDATA", Path.home())) / "AppleTVCast" / "config.json"
-PORT = 8765
+APPDIR = Path(os.environ.get("APPDATA", Path.home())) / "AppleTVCast"
+CONFIG = APPDIR / "config.json"
+CREDS = APPDIR / "doubletake-credentials.json"
+LOG = APPDIR / "cast.log"
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def load_cfg():
@@ -20,42 +27,44 @@ def save_cfg(cfg):
     CONFIG.write_text(json.dumps(cfg, indent=2))
 
 
-def local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80)); return s.getsockname()[0]
-    finally:
-        s.close()
+def _search_dirs():
+    dirs = [Path(sys.argv[0]).resolve().parent, Path(__file__).resolve().parent]
+    if hasattr(sys, "_MEIPASS"):
+        dirs.insert(0, Path(sys._MEIPASS))
+    return dirs
 
 
-def ffmpeg_cmd(outdir, audio_device=None, test_source=False, fps=30, ffmpeg="ffmpeg"):
-    """Build ffmpeg command: screen (+system audio) -> H.264/AAC HLS."""
-    cmd = [ffmpeg, "-hide_banner", "-loglevel", "warning", "-y"]
-    if test_source:
-        cmd += ["-re", "-f", "lavfi", "-i", f"testsrc2=size=1280x720:rate={fps}",
-                "-f", "lavfi", "-i", "sine=frequency=440"]
-    else:
-        cmd += ["-f", "gdigrab", "-framerate", str(fps), "-i", "desktop"]
-        if audio_device:
-            cmd += ["-f", "dshow", "-i", f"audio={audio_device}"]
-    has_audio = test_source or bool(audio_device)
-    cmd += ["-vf", "scale='min(1920,iw)':-2,format=yuv420p",
-            "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-            "-g", str(fps), "-keyint_min", str(fps), "-sc_threshold", "0", "-b:v", "6M"]
-    if has_audio:
-        cmd += ["-c:a", "aac", "-b:a", "160k", "-ar", "48000"]
-    cmd += ["-f", "hls", "-hls_time", "1", "-hls_list_size", "6",
-            "-hls_flags", "delete_segments+independent_segments",
-            str(Path(outdir) / "live.m3u8")]
+def find_tool(name):
+    """Find doubletake/ffmpeg next to the app (or bundled), then on PATH."""
+    exe = name + (".exe" if os.name == "nt" else "")
+    for d in _search_dirs():
+        if (d / exe).exists():
+            return str(d / exe)
+    return shutil.which(name)
+
+
+def tool_env():
+    env = dict(os.environ)
+    ff = find_tool("ffmpeg")
+    if ff:
+        env["DOUBLETAKE_FFMPEG"] = ff
+    return env
+
+
+def pair_cmd(dt, address, port=7000):
+    return [dt, "-target", address, "-port", str(port), "-creds", str(CREDS),
+            "-pair", "-pair-only", "-no-audio"]
+
+
+def cast_cmd(dt, address, cfg):
+    cmd = [dt, "-target", address, "-port", str(cfg.get("port", 7000)), "-creds", str(CREDS),
+           "-quit-on-stdin-eof",
+           "-fps", str(cfg.get("fps", 30))]
+    if cfg.get("no_audio"):
+        cmd.append("-no-audio")
+    if cfg.get("extra_args"):
+        cmd += list(cfg["extra_args"])
     return cmd
-
-
-def start_http(directory, port=PORT):
-    h = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(directory))
-    h.log_message = lambda *a, **k: None
-    srv = http.server.ThreadingHTTPServer(("0.0.0.0", port), h)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv
 
 
 async def discover():
@@ -65,103 +74,139 @@ async def discover():
     return [d for d in found if d.get_service(Protocol.AirPlay)]
 
 
-async def pair(identifier, pin_cb):
-    import pyatv
-    from pyatv.const import Protocol
-    loop = asyncio.get_running_loop()
-    conf = (await pyatv.scan(loop, identifier=identifier, timeout=5))[0]
-    p = await pyatv.pair(conf, Protocol.AirPlay, loop)
-    await p.begin()
-    if p.device_provides_pin:
-        p.pin(int(await loop.run_in_executor(None, pin_cb)))
-    await p.finish()
-    creds = p.service.credentials if p.has_paired else None
-    await p.close()
-    return creds
-
-
-async def play(identifier, creds, url):
-    import pyatv
-    from pyatv.const import Protocol
-    loop = asyncio.get_running_loop()
-    conf = (await pyatv.scan(loop, identifier=identifier, timeout=5))[0]
-    if creds:
-        conf.set_credentials(Protocol.AirPlay, creds)
-    atv = await pyatv.connect(conf, loop)
+def run_pairing(dt, address, ask_pin, timeout=90, port=7000):
+    """Run doubletake -pair-only, answering its PIN prompt. Returns (ok, log)."""
+    APPDIR.mkdir(parents=True, exist_ok=True)
+    p = subprocess.Popen(pair_cmd(dt, address, port), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, env=tool_env(), creationflags=NO_WINDOW)
+    out, asked = "", False
+    timer = threading.Timer(timeout, p.kill); timer.start()
     try:
-        await atv.stream.play_url(url)  # blocks until playback ends
+        while True:
+            chunk = p.stdout.read1(4096) if hasattr(p.stdout, "read1") else p.stdout.read(1)
+            if not chunk:
+                break
+            out += chunk.decode("utf-8", "replace")
+            if not asked and re.search(r"Enter the (PIN|code|receiver)", out):
+                asked = True
+                pin = ask_pin()
+                if not pin:
+                    p.kill(); break
+                p.stdin.write((pin.strip() + "\n").encode()); p.stdin.flush()
+        p.wait()
     finally:
-        atv.close()
+        timer.cancel()
+    return p.returncode == 0 and "pairing complete" in out, out
 
 
 class Caster:
     def __init__(self, cfg):
-        self.cfg, self.proc, self.srv, self.thread = cfg, None, None, None
+        self.cfg, self.proc = cfg, None
 
-    def start(self, status):
-        out = Path(tempfile.mkdtemp(prefix="atvcast_"))
-        ff = shutil.which("ffmpeg") or str(Path(sys.argv[0]).parent / "ffmpeg.exe")
-        self.proc = subprocess.Popen(ffmpeg_cmd(out, self.cfg.get("audio_device"), ffmpeg=ff),
-                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        self.srv = start_http(out)
-        url = f"http://{local_ip()}:{PORT}/live.m3u8"
-        def run():
-            import time
-            for _ in range(30):  # wait for first segments
-                if (out / "live.m3u8").exists(): break
-                time.sleep(0.5)
-            time.sleep(3)
-            try:
-                status("Casting... (picture is a few seconds behind)")
-                asyncio.run(play(self.cfg["device_id"], self.cfg.get("credentials"), url))
-                status("Stopped.")
-            except Exception as e:
-                status(f"Problem: {e}")
-            finally:
-                self.stop()
-        self.thread = threading.Thread(target=run, daemon=True); self.thread.start()
+    def start(self, status, on_exit):
+        dt = find_tool("doubletake")
+        if not dt:
+            return status("doubletake.exe is missing. Put it next to AppleTVCast.exe.")
+        APPDIR.mkdir(parents=True, exist_ok=True)
+        log = open(LOG, "w", encoding="utf-8", errors="replace")
+        self.proc = subprocess.Popen(cast_cmd(dt, self.cfg["address"], self.cfg),
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, env=tool_env(), creationflags=NO_WINDOW)
+        proc = self.proc
+
+        def watch():
+            last = ""
+            for raw in proc.stdout:
+                line = raw.decode("utf-8", "replace")
+                log.write(line); log.flush()
+                if line.strip():
+                    last = line.strip()
+                if "mirror session ready" in line:
+                    status("Casting! Your screen should be on the TV now.")
+                elif "audio capture started" in line:
+                    status("Casting with sound.")
+            proc.wait(); log.close()
+            if self.proc is proc:
+                self.proc = None
+                status("Stopped." if proc.returncode == 0 else
+                       f"Casting stopped with a problem. Details in {LOG}\n{last[-200:]}")
+            on_exit()
+        threading.Thread(target=watch, daemon=True).start()
 
     def stop(self):
-        if self.proc: self.proc.terminate(); self.proc = None
-        if self.srv: self.srv.shutdown(); self.srv = None
+        proc, self.proc = self.proc, None
+        if not proc:
+            return
+        try:
+            proc.stdin.close()  # doubletake shuts down cleanly on stdin EOF
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
 
 
 def gui():
     import tkinter as tk
     from tkinter import simpledialog, messagebox
     cfg = load_cfg(); root = tk.Tk(); root.title("Apple TV Cast")
-    status = tk.StringVar(value="Ready." if cfg.get("device_id") else "First run: click Set up Apple TV.")
+    ready = cfg.get("address") and CREDS.exists()
+    status = tk.StringVar(value=f"Ready to cast to {cfg.get('device_name', 'Apple TV')}." if ready
+                          else "First run: click Set up Apple TV.")
     caster = Caster(cfg)
     say = lambda m: root.after(0, status.set, m)
-
-    def setup():
-        status.set("Looking for Apple TVs...")
-        def work():
-            devs = asyncio.run(discover())
-            if not devs: return say("No Apple TV found. Same Wi-Fi? Apple TV awake?")
-            d = devs[0]
-            ask = lambda: root_call(lambda: simpledialog.askstring("PIN", f"Type the PIN shown on {d.name}:"))
-            try:
-                creds = asyncio.run(pair(d.identifier, ask))
-            except Exception as e:
-                return say(f"Pairing problem: {e}")
-            cfg.update(device_id=d.identifier, device_name=d.name, credentials=creds); save_cfg(cfg)
-            say(f"Paired with {d.name}. Click Cast!")
-        threading.Thread(target=work, daemon=True).start()
+    reset_btn = lambda: root.after(0, btn.config, {"text": "Cast to Apple TV"})
 
     def root_call(fn):
         box, ev = {}, threading.Event()
         root.after(0, lambda: (box.setdefault("v", fn()), ev.set())); ev.wait(); return box["v"]
 
+    def setup():
+        dt = find_tool("doubletake")
+        if not dt:
+            return messagebox.showerror("Apple TV Cast", "doubletake.exe is missing. Put it next to AppleTVCast.exe.")
+        status.set("Looking for Apple TVs...")
+
+        def work():
+            try:
+                devs = asyncio.run(discover())
+            except Exception as e:
+                return say(f"Search problem: {e}")
+            if not devs:
+                return say("No Apple TV found. Same Wi-Fi? Apple TV awake?")
+            d = devs[0]
+            if len(devs) > 1:
+                names = "\n".join(f"{i+1}. {x.name}" for i, x in enumerate(devs))
+                pick = root_call(lambda: simpledialog.askinteger("Apple TV Cast", f"Which one?\n{names}",
+                                                                minvalue=1, maxvalue=len(devs)))
+                if not pick:
+                    return say("Setup cancelled.")
+                d = devs[pick - 1]
+            address = str(d.address)
+            say(f"Pairing with {d.name}... a code should appear on the TV.")
+            ok, out = run_pairing(dt, address, lambda: root_call(
+                lambda: simpledialog.askstring("PIN", f"Type the 4-digit code shown on {d.name}:")))
+            APPDIR.mkdir(parents=True, exist_ok=True)
+            (APPDIR / "pair.log").write_text(out, encoding="utf-8")
+            if not ok:
+                return say(f"Pairing didn't finish. Details in {APPDIR / 'pair.log'}")
+            cfg.update(device_id=d.identifier, device_name=d.name, address=address,
+                       doubletake_credentials=str(CREDS))
+            cfg.pop("credentials", None)  # old pyatv play_url credentials, no longer used
+            save_cfg(cfg)
+            say(f"Paired with {d.name}. Click Cast!")
+        threading.Thread(target=work, daemon=True).start()
+
     def toggle():
-        if caster.proc: caster.stop(); btn.config(text="Cast to Apple TV"); status.set("Stopped.")
-        elif not cfg.get("device_id"): messagebox.showinfo("Apple TV Cast", "Click 'Set up Apple TV' first.")
-        else: caster.start(say); btn.config(text="Stop"); status.set("Starting...")
+        if caster.proc:
+            caster.stop(); btn.config(text="Cast to Apple TV"); status.set("Stopped.")
+        elif not (cfg.get("address") and CREDS.exists()):
+            messagebox.showinfo("Apple TV Cast", "Click 'Set up Apple TV' first.")
+        else:
+            caster.start(say, reset_btn); btn.config(text="Stop"); status.set("Connecting...")
 
     btn = tk.Button(root, text="Cast to Apple TV", font=("Segoe UI", 20, "bold"), width=18, height=2, command=toggle)
     btn.pack(padx=20, pady=15)
     tk.Button(root, text="Set up Apple TV", command=setup).pack()
-    tk.Label(root, textvariable=status, wraplength=380).pack(pady=10)
+    tk.Label(root, textvariable=status, wraplength=380, justify="left").pack(pady=10)
     root.protocol("WM_DELETE_WINDOW", lambda: (caster.stop(), root.destroy()))
     root.mainloop()
 

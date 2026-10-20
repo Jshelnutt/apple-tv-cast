@@ -5,11 +5,15 @@ winget install -e --id Gyan.FFmpeg --accept-package-agreements --accept-source-a
 winget install -e --id Git.Git
 # open a NEW PowerShell window so PATH updates
 cd $HOME; git clone https://github.com/Jshelnutt/apple-tv-cast.git; cd apple-tv-cast
+# put doubletake.exe in this folder (see below), then:
 py -m venv .venv; .\.venv\Scripts\pip install -r requirements.txt pyinstaller
 .\build.bat
 ```
-(The repo is private, so git asks you to sign in to GitHub. Or download the ZIP instead.)
+**doubletake.exe**: build it from the `windows` branch of Jshelnutt/doubletake
+(`GOOS=windows go build -o doubletake.exe ./cmd/doubletake`), or copy a ready-built one,
+and drop it into the `apple-tv-cast` folder. `build.bat` bundles it, plus ffmpeg.exe if
+it finds one, into `dist\AppleTVCast.exe` and makes the **Apple TV Cast** Desktop shortcut.
 
-Allow Windows Firewall access for **Private networks** when it asks. The Apple TV must be able to reach port 8765.
-
-`build.bat` creates `dist\AppleTVCast.exe` and puts an **Apple TV Cast** shortcut on the Desktop. ffmpeg must be on PATH, or you can copy `ffmpeg.exe` next to the exe.
+On the Apple TV, set Settings > AirPlay and HomeKit > Allow Access to "Everyone on the
+same network". When Windows asks about the firewall, allow **Private networks**.
+Run **Set up Apple TV** once (it pairs again with doubletake; the old pairing isn't reused).
