@@ -94,12 +94,17 @@ async def discover_speakers():
 
 
 class SpeakerStream:
-    """System sound -> doubletake -pcm-stdout -> ffmpeg MP3 -> pyatv RAOP (HomePods)."""
+    """System sound -> doubletake -pcm-stdout -> ffmpeg MP3 -> pyatv RAOP (HomePods).
+    Everything (incl. pyatv's own debug log) goes to %APPDATA%/AppleTVCast/speaker.log.
+    If the stream ends while casting it is restarted with back-off."""
+
+    MAX_RESTARTS = 5
 
     def __init__(self, cfg, status):
         self.cfg, self.status = cfg, status
-        self.loop = self.task = self.pcm = None
+        self.loop = self.task = self.pcm = self.enc = None
         self.thread = None
+        self.stopped = False
 
     def start(self):
         dt, ff = find_tool("doubletake"), find_tool("ffmpeg")
@@ -108,49 +113,100 @@ class SpeakerStream:
         self.thread = threading.Thread(target=self._run, args=(dt, ff), daemon=True)
         self.thread.start()
 
-    def _run(self, dt, ff):
-        self.loop = asyncio.new_event_loop()
-        try:
-            self.task = self.loop.create_task(self._stream(dt, ff))
-            self.loop.run_until_complete(self.task)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            self.status(f"HomePod sound problem: {e}")
-        finally:
-            self._kill()
-
-    async def _stream(self, dt, ff):
-        import pyatv
+    def _logger(self):
+        import logging
         APPDIR.mkdir(parents=True, exist_ok=True)
-        log = open(APPDIR / "speaker.log", "w", encoding="utf-8", errors="replace")
-        self.pcm = subprocess.Popen(pcm_cmd(dt), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=log, env=tool_env(), creationflags=NO_WINDOW)
-        enc = await asyncio.create_subprocess_exec(*mp3_cmd(ff), stdin=self.pcm.stdout,
-                                                   stdout=asyncio.subprocess.PIPE, stderr=log,
-                                                   creationflags=NO_WINDOW)
-        self.enc = enc
+        self.logf = open(APPDIR / "speaker.log", "a", encoding="utf-8", errors="replace")
+        h = logging.StreamHandler(self.logf)
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        lg = logging.getLogger("pyatv")
+        lg.setLevel(logging.DEBUG if self.cfg.get("speaker_debug", True) else logging.INFO)
+        lg.handlers = [h]
+        app = logging.getLogger("atvcast.speaker"); app.setLevel(logging.INFO); app.handlers = [h]
+        return app
+
+    def _run(self, dt, ff):
+        import time
+        log = self._logger()
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        restarts = 0
+        while not self.stopped:
+            started = time.time()
+            try:
+                self.task = self.loop.create_task(self._stream(dt, ff, log))
+                self.loop.run_until_complete(self.task)
+                log.warning("stream_file returned (HomePod ended the stream)")
+            except asyncio.CancelledError:
+                log.info("speaker stream cancelled")
+            except Exception as e:
+                log.exception("speaker stream failed: %r", e)
+            finally:
+                self._kill()
+            if self.stopped:
+                break
+            if time.time() - started > 60:
+                restarts = 0
+            restarts += 1
+            if restarts > self.MAX_RESTARTS:
+                self.status(f"Sound to {self.cfg.get('speaker_name')} keeps stopping. Details in {APPDIR / 'speaker.log'}")
+                break
+            wait = min(2 * restarts, 10)
+            log.info("restarting speaker stream in %ss (attempt %d/%d)", wait, restarts, self.MAX_RESTARTS)
+            self.status(f"Sound to {self.cfg.get('speaker_name')} dropped; reconnecting ({restarts})...")
+            time.sleep(wait)
+        log.info("speaker stream thread exit")
+        self.logf.close()
+
+    async def _stream(self, dt, ff, log):
+        import pyatv
+        from pyatv.const import Protocol
+        from pyatv.interface import MediaMetadata
         loop = asyncio.get_running_loop()
         confs = await pyatv.scan(loop, identifier=self.cfg["speaker_id"], timeout=5)
         if not confs:
-            raise RuntimeError(f"{self.cfg.get('speaker_name', 'HomePod')} not found on the network")
-        atv = await pyatv.connect(confs[0], loop)
+            raise RuntimeError(f"{self.cfg.get('speaker_name', 'HomePod')} ({self.cfg['speaker_id']}) not found")
+        conf = confs[0]
         try:
-            from pyatv.interface import MediaMetadata
-            await atv.stream.stream_file(enc.stdout, metadata=MediaMetadata(title="PC sound", artist="Apple TV Cast"))
+            log.info("speaker %s at %s; services: %s", getattr(conf, "name", "?"), getattr(conf, "address", "?"),
+                     [(str(sv.protocol), sv.port) for sv in conf.services])
+        except Exception:
+            pass
+        if self.cfg.get("speaker_raop_only", True) and hasattr(conf, "_services"):
+            # Stream with plain RAOP; ignore the HomePod's AirPlay/Companion
+            # services so pyatv doesn't try to control the home-theater group.
+            for sv in list(conf.services):
+                if sv.protocol not in (Protocol.RAOP,):
+                    try:
+                        conf._services.pop(sv.protocol, None)  # best effort
+                    except Exception:
+                        pass
+        self.pcm = subprocess.Popen(pcm_cmd(dt), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=self.logf, env=tool_env(), creationflags=NO_WINDOW)
+        self.enc = await asyncio.create_subprocess_exec(*mp3_cmd(ff), stdin=self.pcm.stdout,
+                                                        stdout=asyncio.subprocess.PIPE, stderr=self.logf,
+                                                        creationflags=NO_WINDOW)
+        atv = await pyatv.connect(conf, loop)
+        log.info("connected; starting stream_file")
+        self.status(f"Casting! Sound goes to {self.cfg.get('speaker_name')} (about 2 s behind; picture is delayed to match).")
+        try:
+            await atv.stream.stream_file(self.enc.stdout, metadata=MediaMetadata(title="PC sound", artist="Apple TV Cast"))
         finally:
+            log.info("closing speaker connection (pcm rc=%s, mp3 rc=%s)",
+                     self.pcm.poll() if self.pcm else None, self.enc.returncode if self.enc else None)
             atv.close()
 
     def _kill(self):
-        for p in (self.pcm, getattr(self, "enc", None)):
+        for p in (self.pcm, self.enc):
             try:
-                if p:
+                if p and (getattr(p, "returncode", None) is None):
                     p.kill()
             except Exception:
                 pass
-        self.pcm = None
+        self.pcm = self.enc = None
 
     def stop(self):
+        self.stopped = True
         if self.loop and self.task and not self.task.done():
             self.loop.call_soon_threadsafe(self.task.cancel)
         self._kill()
@@ -192,36 +248,59 @@ class Caster:
     def __init__(self, cfg):
         self.cfg, self.proc, self.speaker = cfg, None, None
 
+    MIRROR_RETRIES = 3
+
     def start(self, status, on_exit):
         dt = find_tool("doubletake")
         if not dt:
             return status("doubletake.exe is missing. Put it next to AppleTVCast.exe.")
         APPDIR.mkdir(parents=True, exist_ok=True)
+        self.stopping = False
         log = open(LOG, "w", encoding="utf-8", errors="replace")
-        self.proc = subprocess.Popen(cast_cmd(dt, self.cfg["address"], self.cfg),
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, env=tool_env(), creationflags=NO_WINDOW)
-        proc = self.proc
-        if homepod_mode(self.cfg):
-            self.speaker = SpeakerStream(self.cfg, status)
-            self.speaker.start()
+
+        def launch():
+            return subprocess.Popen(cast_cmd(dt, self.cfg["address"], self.cfg),
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, env=tool_env(), creationflags=NO_WINDOW)
+        self.proc = launch()
 
         def watch():
-            last = ""
-            for raw in proc.stdout:
-                line = raw.decode("utf-8", "replace")
-                log.write(line); log.flush()
-                if line.strip():
-                    last = line.strip()
-                if "mirror session ready" in line:
-                    status("Casting! Your screen should be on the TV now." + (
-                        f" Sound goes to {self.cfg.get('speaker_name')} (starts ~2 s later)."
-                        if homepod_mode(self.cfg) else ""))
-                elif "audio capture started" in line:
-                    status("Casting with sound.")
-            proc.wait(); log.close()
-            if self.speaker:
-                self.speaker.stop(); self.speaker = None
+            import time
+            attempt, last, proc = 1, "", self.proc
+            while True:
+                ready = False
+                for raw in proc.stdout:
+                    line = raw.decode("utf-8", "replace")
+                    log.write(line); log.flush()
+                    if line.strip():
+                        last = line.strip()
+                    if "mirror session ready" in line and not ready:
+                        ready = True
+                        if homepod_mode(self.cfg):
+                            # Start the HomePod stream only once the Apple TV
+                            # session is up, so the two AirPlay setups don't race.
+                            status(f"Casting! Connecting sound to {self.cfg.get('speaker_name')}...")
+                            self.speaker = SpeakerStream(self.cfg, status)
+                            self.speaker.start()
+                        else:
+                            status("Casting! Your screen should be on the TV now.")
+                    elif "audio capture started" in line and not homepod_mode(self.cfg):
+                        status("Casting with sound.")
+                proc.wait()
+                if self.speaker:
+                    self.speaker.stop(); self.speaker = None
+                retry = (not ready and not self.stopping and self.proc is proc and proc.returncode != 0
+                         and attempt < self.MIRROR_RETRIES)
+                if not retry:
+                    break
+                attempt += 1
+                log.write(f"--- mirror setup failed; retry {attempt}/{self.MIRROR_RETRIES} in 3 s ---\n"); log.flush()
+                status(f"Apple TV didn't accept the connection; retrying ({attempt}/{self.MIRROR_RETRIES})...")
+                time.sleep(3)
+                if self.stopping:
+                    break
+                proc = self.proc = launch()
+            log.close()
             if self.proc is proc:
                 self.proc = None
                 status("Stopped." if proc.returncode == 0 else
@@ -230,6 +309,7 @@ class Caster:
         threading.Thread(target=watch, daemon=True).start()
 
     def stop(self):
+        self.stopping = True
         if self.speaker:
             self.speaker.stop(); self.speaker = None
         proc, self.proc = self.proc, None

@@ -71,8 +71,14 @@ def test_homepod_sound_pipeline(app, monkeypatch):
     monkeypatch.setattr(pyatv, "connect", connect)
     msgs = []
     s = castapp.SpeakerStream({"speaker_id": "x"}, msgs.append)
-    s.start(); s.thread.join(20)
-    assert got.get("bytes", 0) > 80000, (got, msgs)  # ~320 kbps for 3 s, in real time
+    s.start()
+    for _ in range(100):
+        if "bytes" in got:
+            break
+        time.sleep(0.1)
+    s.stop(); s.thread.join(15)
+    assert got.get("bytes", 0) > 80000, (got, msgs)
+    assert "starting stream_file" in (castapp.APPDIR / "speaker.log").read_text()  # ~320 kbps for 3 s, in real time
 
 
 def test_homepod_mode_cast_cmd(app):
