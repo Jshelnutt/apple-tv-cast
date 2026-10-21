@@ -46,3 +46,36 @@ def test_pair_then_cast_then_stop(app):
     assert done and c.proc is None, msgs
     log = castapp.LOG.read_text()
     assert "mirror session ready" in log and "stream ended" in log
+
+
+def test_homepod_sound_pipeline(app, monkeypatch):
+    """PC sound -> doubletake -pcm-stdout -> ffmpeg MP3 -> (fake) pyatv RAOP stream."""
+    castapp, _ = app
+    import asyncio, pyatv
+    got = {}
+
+    class FakeStream:
+        async def stream_file(self, src, metadata=None):
+            n, t = 0, time.time()
+            while time.time() - t < 3:
+                n += len(await src.read(4096))
+            got["bytes"] = n
+
+    class FakeATV:
+        stream = FakeStream()
+        def close(self): pass
+
+    async def scan(loop, identifier=None, timeout=5): return [object()]
+    async def connect(conf, loop): return FakeATV()
+    monkeypatch.setattr(pyatv, "scan", scan)
+    monkeypatch.setattr(pyatv, "connect", connect)
+    msgs = []
+    s = castapp.SpeakerStream({"speaker_id": "x"}, msgs.append)
+    s.start(); s.thread.join(20)
+    assert got.get("bytes", 0) > 80000, (got, msgs)  # ~320 kbps for 3 s, in real time
+
+
+def test_homepod_mode_cast_cmd(app):
+    castapp, _ = app
+    cmd = castapp.cast_cmd("dt", "1.2.3.4", {"speaker_id": "hp", "video_delay_ms": 1500})
+    assert "-no-audio" in cmd and cmd[cmd.index("-target-latency-ms") + 1] == "1500"

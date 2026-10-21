@@ -56,15 +56,104 @@ def pair_cmd(dt, address, port=7000):
             "-pair", "-pair-only", "-no-audio"]
 
 
+def homepod_mode(cfg):
+    return bool(cfg.get("speaker_id"))
+
+
 def cast_cmd(dt, address, cfg):
     cmd = [dt, "-target", address, "-port", str(cfg.get("port", 7000)), "-creds", str(CREDS),
            "-quit-on-stdin-eof",
            "-fps", str(cfg.get("fps", 30))]
-    if cfg.get("no_audio"):
+    if cfg.get("no_audio") or homepod_mode(cfg):
+        # tvOS does not forward screen-mirroring sound to HomePods that are the
+        # Apple TV's audio output, so in HomePod mode sound goes to them directly.
         cmd.append("-no-audio")
+    if homepod_mode(cfg) and cfg.get("video_delay_ms", 1800):
+        # Hold the picture back so it lines up with the HomePods' ~2 s buffer.
+        cmd += ["-target-latency-ms", str(cfg.get("video_delay_ms", 1800))]
     if cfg.get("extra_args"):
         cmd += list(cfg["extra_args"])
     return cmd
+
+
+def pcm_cmd(dt):
+    return [dt, "-pcm-stdout"]
+
+
+def mp3_cmd(ff):
+    return [ff, "-hide_banner", "-loglevel", "error", "-probesize", "32", "-analyzeduration", "0", "-fflags", "nobuffer",
+            "-f", "s16le", "-ar", "44100", "-ac", "2",
+            "-i", "pipe:0", "-c:a", "libmp3lame", "-b:a", "320k", "-f", "mp3", "-flush_packets", "1", "pipe:1"]
+
+
+async def discover_speakers():
+    import pyatv
+    from pyatv.const import Protocol
+    found = await pyatv.scan(asyncio.get_running_loop(), timeout=5)
+    return [d for d in found if d.get_service(Protocol.RAOP)]
+
+
+class SpeakerStream:
+    """System sound -> doubletake -pcm-stdout -> ffmpeg MP3 -> pyatv RAOP (HomePods)."""
+
+    def __init__(self, cfg, status):
+        self.cfg, self.status = cfg, status
+        self.loop = self.task = self.pcm = None
+        self.thread = None
+
+    def start(self):
+        dt, ff = find_tool("doubletake"), find_tool("ffmpeg")
+        if not (dt and ff):
+            return self.status("Sound to HomePods needs doubletake.exe and ffmpeg.exe next to the app.")
+        self.thread = threading.Thread(target=self._run, args=(dt, ff), daemon=True)
+        self.thread.start()
+
+    def _run(self, dt, ff):
+        self.loop = asyncio.new_event_loop()
+        try:
+            self.task = self.loop.create_task(self._stream(dt, ff))
+            self.loop.run_until_complete(self.task)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.status(f"HomePod sound problem: {e}")
+        finally:
+            self._kill()
+
+    async def _stream(self, dt, ff):
+        import pyatv
+        APPDIR.mkdir(parents=True, exist_ok=True)
+        log = open(APPDIR / "speaker.log", "w", encoding="utf-8", errors="replace")
+        self.pcm = subprocess.Popen(pcm_cmd(dt), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=log, env=tool_env(), creationflags=NO_WINDOW)
+        enc = await asyncio.create_subprocess_exec(*mp3_cmd(ff), stdin=self.pcm.stdout,
+                                                   stdout=asyncio.subprocess.PIPE, stderr=log,
+                                                   creationflags=NO_WINDOW)
+        self.enc = enc
+        loop = asyncio.get_running_loop()
+        confs = await pyatv.scan(loop, identifier=self.cfg["speaker_id"], timeout=5)
+        if not confs:
+            raise RuntimeError(f"{self.cfg.get('speaker_name', 'HomePod')} not found on the network")
+        atv = await pyatv.connect(confs[0], loop)
+        try:
+            from pyatv.interface import MediaMetadata
+            await atv.stream.stream_file(enc.stdout, metadata=MediaMetadata(title="PC sound", artist="Apple TV Cast"))
+        finally:
+            atv.close()
+
+    def _kill(self):
+        for p in (self.pcm, getattr(self, "enc", None)):
+            try:
+                if p:
+                    p.kill()
+            except Exception:
+                pass
+        self.pcm = None
+
+    def stop(self):
+        if self.loop and self.task and not self.task.done():
+            self.loop.call_soon_threadsafe(self.task.cancel)
+        self._kill()
 
 
 async def discover():
@@ -101,7 +190,7 @@ def run_pairing(dt, address, ask_pin, timeout=90, port=7000):
 
 class Caster:
     def __init__(self, cfg):
-        self.cfg, self.proc = cfg, None
+        self.cfg, self.proc, self.speaker = cfg, None, None
 
     def start(self, status, on_exit):
         dt = find_tool("doubletake")
@@ -113,6 +202,9 @@ class Caster:
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, env=tool_env(), creationflags=NO_WINDOW)
         proc = self.proc
+        if homepod_mode(self.cfg):
+            self.speaker = SpeakerStream(self.cfg, status)
+            self.speaker.start()
 
         def watch():
             last = ""
@@ -122,10 +214,14 @@ class Caster:
                 if line.strip():
                     last = line.strip()
                 if "mirror session ready" in line:
-                    status("Casting! Your screen should be on the TV now.")
+                    status("Casting! Your screen should be on the TV now." + (
+                        f" Sound goes to {self.cfg.get('speaker_name')} (starts ~2 s later)."
+                        if homepod_mode(self.cfg) else ""))
                 elif "audio capture started" in line:
                     status("Casting with sound.")
             proc.wait(); log.close()
+            if self.speaker:
+                self.speaker.stop(); self.speaker = None
             if self.proc is proc:
                 self.proc = None
                 status("Stopped." if proc.returncode == 0 else
@@ -134,6 +230,8 @@ class Caster:
         threading.Thread(target=watch, daemon=True).start()
 
     def stop(self):
+        if self.speaker:
+            self.speaker.stop(); self.speaker = None
         proc, self.proc = self.proc, None
         if not proc:
             return
@@ -203,9 +301,37 @@ def gui():
         else:
             caster.start(say, reset_btn); btn.config(text="Stop"); status.set("Connecting...")
 
+    def pick_sound():
+        status.set("Looking for HomePods and AirPlay speakers...")
+
+        def work():
+            try:
+                spk = asyncio.run(discover_speakers())
+            except Exception as e:
+                return say(f"Search problem: {e}")
+            spk = [d for d in spk if d.identifier != cfg.get("device_id")]
+            names = "\n".join(f"{i+1}. {x.name}" for i, x in enumerate(spk))
+            pick = root_call(lambda: simpledialog.askinteger(
+                "Sound output", "Where should the PC's sound play?\n0. Apple TV (TV/projector speakers)\n" + names,
+                minvalue=0, maxvalue=len(spk)))
+            if pick is None:
+                return say("No change.")
+            if pick == 0:
+                cfg.pop("speaker_id", None); cfg.pop("speaker_name", None)
+                save_cfg(cfg); return say("Sound will go to the Apple TV.")
+            d = spk[pick - 1]
+            delay = root_call(lambda: simpledialog.askinteger(
+                "Picture delay", "Delay the picture to match the speakers (milliseconds, 0-2000):",
+                initialvalue=cfg.get("video_delay_ms", 1800), minvalue=0, maxvalue=2000))
+            cfg.update(speaker_id=d.identifier, speaker_name=d.name,
+                       video_delay_ms=1800 if delay is None else delay)
+            save_cfg(cfg); say(f"Sound will go to {d.name}.")
+        threading.Thread(target=work, daemon=True).start()
+
     btn = tk.Button(root, text="Cast to Apple TV", font=("Segoe UI", 20, "bold"), width=18, height=2, command=toggle)
     btn.pack(padx=20, pady=15)
     tk.Button(root, text="Set up Apple TV", command=setup).pack()
+    tk.Button(root, text="Sound output...", command=pick_sound).pack(pady=(6, 0))
     tk.Label(root, textvariable=status, wraplength=380, justify="left").pack(pady=10)
     root.protocol("WM_DELETE_WINDOW", lambda: (caster.stop(), root.destroy()))
     root.mainloop()
