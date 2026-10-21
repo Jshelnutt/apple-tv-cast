@@ -22,13 +22,13 @@ its own license; full texts are at the links below.
   `--enable-gpl --enable-version3` (includes libx264 and other GPL libraries).
 * License: GNU General Public License v3.0: https://www.gnu.org/licenses/gpl-3.0.html
   (FFmpeg legal info: https://ffmpeg.org/legal.html)
-* Source code: FFmpeg source is at https://ffmpeg.org/download.html and
-  https://git.ffmpeg.org/ffmpeg.git. The build's exact source and build configuration
-  are published by gyan.dev (https://www.gyan.dev/ffmpeg/builds/, linking to
-  https://github.com/GyanD/codexffmpeg). If you can't obtain the corresponding source
-  for the ffmpeg.exe shipped in a release of this project, open an issue on this
-  repository requesting it; this written offer is valid for three years from the date
-  of that release.
+* Source code: the official FFmpeg source code for every release is at
+  https://ffmpeg.org/download.html (git: https://git.ffmpeg.org/ffmpeg.git). The
+  build used here, including its version and configuration, is described on the
+  gyan.dev builds page: https://www.gyan.dev/ffmpeg/builds/. If you can't obtain the
+  corresponding source for the ffmpeg.exe shipped in a release of this project, open
+  an issue on this repository requesting it; this written offer is valid for three
+  years from the date of that release.
 
 ## pyatv (bundled inside AppleTVCast.exe)
 
