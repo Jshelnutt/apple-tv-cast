@@ -15,6 +15,24 @@ with one big **Cast to Apple TV** button.
 > help, and issues or questions may not be answered. A future Apple software update
 > may stop it from working at any time.
 
+## In plain words
+
+This is a Windows program that copies your computer's screen and sound to an Apple TV on the same home Wi-Fi. You pick the Apple TV, type the code it shows, then click **Cast to Apple TV**.
+
+The easiest way to use it is to download `AppleTVCast.zip` from the [latest release](../../releases/latest), unzip it, and run `AppleTVCast.exe`. Windows may warn you because the app isn't signed; choose **More info > Run anyway**.
+
+This is an unofficial personal project. It is not made by Apple, and a future Apple update could stop it from working.
+
+**To check that it still works after a change**, you need FFmpeg and a built copy of `doubletake` plus `doubletake-test-receiver` from the `windows` branch of [Jshelnutt/doubletake](https://github.com/Jshelnutt/doubletake). Then:
+
+```
+pip install -r requirements.txt pytest
+set DOUBLETAKE_BIN_DIR=C:\path\to\folder\with\those\programs
+pytest tests
+```
+
+On Linux (with those programs built for Linux), set `DOUBLETAKE_BIN_DIR` and run `pytest tests` the same way. If that folder is not set, the tests skip instead of failing.
+
 ## Setup (Windows 10/11)
 
 1. Download `AppleTVCast.zip` from the [latest release](../../releases/latest).

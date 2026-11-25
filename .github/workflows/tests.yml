@@ -1,0 +1,49 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout apple-tv-cast
+        uses: actions/checkout@v4
+
+      - name: Checkout doubletake (windows branch)
+        uses: actions/checkout@v4
+        with:
+          repository: Jshelnutt/doubletake
+          ref: windows
+          path: _doubletake
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: _doubletake/go.mod
+          cache-dependency-path: _doubletake/go.sum
+
+      - name: Build doubletake and the test receiver
+        working-directory: _doubletake
+        run: |
+          go build -o bin/doubletake ./cmd/doubletake
+          go build -o bin/doubletake-test-receiver ./cmd/doubletake-test-receiver
+
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python packages
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest
+
+      - name: Run tests
+        env:
+          DOUBLETAKE_BIN_DIR: ${{ github.workspace }}/_doubletake/bin
+        run: python -m pytest tests -q --tb=short
